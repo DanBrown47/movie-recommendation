@@ -14,6 +14,11 @@ from recommender_core import (
     recommend_for_user,
 )
 
+# testing stuff
+import math
+from typing import Dict, Tuple, List
+
+
 CFG_PATH = "config.yaml"
 cfg = yaml.safe_load(open(CFG_PATH))
 DATA_DIR = Path("./data")
@@ -129,6 +134,147 @@ def record_feedback(user_id: int, item_id: int, label: str) -> None:
     fb[ukey] = u
     save_feedback(fb)
     st.toast(f"Saved {label}: {item_id}", icon="👍" if label == "like" else "👎")
+
+import math
+from typing import Dict, Tuple, List
+
+def _dcg_at_k(rank: int) -> float:
+    # leave-one-out binary relevance: dcg = 1 / log2(rank+1)
+    return 1.0 / math.log2(rank + 1) if rank > 0 else 0.0
+
+def _intra_list_diversity(item_ids: np.ndarray, item_embs_map: Dict[int, int], item_embs: np.ndarray) -> float:
+    # 1 - average pairwise cosine among the K recs
+    idxs = [item_embs_map.get(i, -1) for i in item_ids]
+    idxs = [i for i in idxs if i >= 0]
+    if len(idxs) < 2:
+        return 0.0
+    V = item_embs[idxs]
+    V = V / (np.linalg.norm(V, axis=1, keepdims=True) + 1e-12)
+    S = V @ V.T  # cosine
+    m = S.shape[0]
+    off_diag_sum = (S.sum() - np.trace(S))
+    pairs = m * (m - 1)
+    avg_cos = off_diag_sum / pairs
+    return float(1.0 - avg_cos)
+
+def _novelty(item_ids: np.ndarray, pop_counts: Dict[int, int], total_pos: int) -> float:
+    # higher is more novel
+    vals = []
+    for iid in item_ids:
+        p = pop_counts.get(int(iid), 0) + 1e-9
+        vals.append(-math.log(p / max(total_pos, 1)))
+    return float(np.mean(vals)) if vals else 0.0
+
+def _leave_one_out_split(ratings: pd.DataFrame, min_positive: float = 4.0) -> Dict[int, Tuple[pd.DataFrame, Tuple[int,int,int]]]:
+    """
+    For each user with >=2 positives, hold out the latest positive (by timestamp).
+    Returns { user_id: (ratings_train_user_df, (holdout_item_id, holdout_ts, n_train_pos)) }
+    """
+    out = {}
+    pos = ratings[ratings["rating"] >= min_positive].copy()
+    if pos.empty:
+        return out
+    pos = pos.sort_values(["user_id","timestamp"])
+    for uid, grp in pos.groupby("user_id"):
+        if len(grp) < 2:
+            continue
+        ho = grp.iloc[-1]  # last positive
+        # build a per-user train df: all user rows except the exact holdout row
+        # (Use index to avoid collisions)
+        user_all = ratings[ratings["user_id"] == uid]
+        mask = ~((user_all["item_id"] == ho["item_id"]) & (user_all["timestamp"] == ho["timestamp"]))
+        train_user = user_all[mask].copy()
+        out[int(uid)] = (train_user, (int(ho["item_id"]), int(ho["timestamp"]), int((grp.shape[0]-1))))
+    return out
+
+def run_offline_eval(
+    ratings: pd.DataFrame,
+    items: pd.DataFrame,
+    item_embs: np.ndarray,
+    store,  # FaissStore
+    item_ids: np.ndarray,
+    k: int,
+    fetch: int,
+    min_positive: float,
+    mmr_lambda: float | None,
+    user_sample: int | None = None,
+    respect_dislikes: bool = False,
+    feedback: dict | None = None,
+) -> Dict[str, float]:
+    # popularity for novelty
+    pos = ratings[ratings["rating"] >= min_positive]
+    pop_counts = pos.groupby("item_id").size().to_dict()
+    total_pos = int(len(pos))
+    # item id -> row index in emb matrix
+    emb_row = {int(i): idx for idx, i in enumerate(item_ids)}
+
+    splits = _leave_one_out_split(ratings, min_positive=min_positive)
+    users = list(splits.keys())
+    if user_sample is not None and user_sample < len(users):
+        users = users[:user_sample]  # simple slice; could randomize if you want
+
+    hits = 0
+    mrr_sum = 0.0
+    ndcg_sum = 0.0
+    cov = set()
+    divs = []
+    novs = []
+
+    for uid in users:
+        train_user, (ho_item, _, _) = splits[uid]
+
+        # optional exclusions (dislikes)
+        exclude = set()
+        if respect_dislikes and feedback:
+            exclude = set(feedback.get(str(uid), {}).get("dislike", []))
+
+        # recommend using only the user's TRAIN interactions
+        df = recommend_for_user(
+            user_id=uid,
+            ratings=train_user,     # <- prevent leakage
+            items=items,
+            item_embs=item_embs,
+            store=store,
+            item_ids=item_ids,
+            k=k,
+            fetch=fetch,
+            min_positive=min_positive,
+            mmr_lambda=mmr_lambda,
+            popular_ids=np.array([]),  # unused path here
+            exclude_ids=exclude,
+        )
+
+        rec_ids = df["item_id"].to_numpy(dtype=int)
+        cov.update(rec_ids.tolist())
+
+        # metrics vs holdout
+        try:
+            rank_pos = int(np.where(rec_ids == ho_item)[0][0]) + 1  # 1-based
+            hits += 1
+            mrr_sum += 1.0 / rank_pos
+            ndcg_sum += _dcg_at_k(rank_pos)
+        except IndexError:
+            # not found in top-K
+            pass
+        except Exception:
+            pass
+
+        # list-level metrics
+        divs.append(_intra_list_diversity(rec_ids, emb_row, item_embs))
+        novs.append(_novelty(rec_ids, pop_counts, total_pos))
+
+    n = max(len(users), 1)
+    K = max(k, 1)
+    # Ideal DCG for binary with single positive is 1/log2(1+1)=1
+    return {
+        "users_eval": float(len(users)),
+        "HitRate@K": hits / n,
+        "MRR": mrr_sum / n,
+        "NDCG@K": ndcg_sum / n,
+        "Diversity": float(np.mean(divs)) if divs else 0.0,
+        "Coverage": len(cov) / max(len(items), 1),
+        "Novelty": float(np.mean(novs)) if novs else 0.0,
+    }
 
 
 # ---------- UI ----------
@@ -284,3 +430,69 @@ if data_ok:
         fb[str(pick_user)] = {"like": [], "dislike": []}
         save_feedback(fb)
         st.success("Cleared.")
+
+st.divider()
+st.header("5) Offline Evaluation")
+
+if data_ok and art_ok:
+    eval_k = st.number_input("K for metrics", min_value=1, max_value=50, value=int(k))
+    eval_fetch = st.number_input("Fetch (ANN) for eval", min_value=10, max_value=2000, value=int(fetch), step=10)
+    sample_n = st.number_input("Users to evaluate (leave-one-out)", min_value=10, max_value=943, value=300, step=10)
+    respect_dislikes = st.checkbox("Respect current dislikes during eval", value=False)
+    compare_mmr = st.checkbox("Compare with MMR off (side-by-side)", value=True)
+
+    if st.button("Run Evaluation", type="secondary"):
+        try:
+            item_embs = np.load(ITEM_EMBS_NPY)
+            item_ids  = np.load(ITEM_IDS_NPY)
+            store     = cached_load_faiss(str(FAISS_PATH))
+            fb        = load_feedback()
+
+            with st.spinner("Computing metrics..."):
+                m1 = run_offline_eval(
+                    ratings=ratings,
+                    items=items,
+                    item_embs=item_embs,
+                    store=store,
+                    item_ids=item_ids,
+                    k=int(eval_k),
+                    fetch=int(eval_fetch),
+                    min_positive=float(cfg["recs"]["min_positive"]),
+                    mmr_lambda=float(mmr_lambda),
+                    user_sample=int(sample_n),
+                    respect_dislikes=bool(respect_dislikes),
+                    feedback=fb,
+                )
+
+                if compare_mmr:
+                    m0 = run_offline_eval(
+                        ratings=ratings,
+                        items=items,
+                        item_embs=item_embs,
+                        store=store,
+                        item_ids=item_ids,
+                        k=int(eval_k),
+                        fetch=int(eval_fetch),
+                        min_positive=float(cfg["recs"]["min_positive"]),
+                        mmr_lambda=None,  # <- no MMR
+                        user_sample=int(sample_n),
+                        respect_dislikes=bool(respect_dislikes),
+                        feedback=fb,
+                    )
+                    dfm = pd.DataFrame([{"Setting":"MMR OFF", **m0},{"Setting":"MMR ON", **m1}]).set_index("Setting")
+                    st.subheader("Metrics (leave-one-out, last positive per user)")
+                    st.dataframe(dfm, use_container_width=True)
+                else:
+                    st.subheader("Metrics (leave-one-out, last positive per user)")
+                    st.dataframe(pd.DataFrame([m1]), use_container_width=True)
+
+                # quick headline metrics
+                c1,c2,c3 = st.columns(3)
+                c1.metric("HitRate@K", f"{m1['HitRate@K']:.3f}")
+                c2.metric("NDCG@K", f"{m1['NDCG@K']:.3f}")
+                c3.metric("MRR", f"{m1['MRR']:.3f}")
+
+        except Exception as e:
+            st.error(f"Eval failed: {e}")
+else:
+    st.info("Provide data and build artifacts to run evaluation.")
