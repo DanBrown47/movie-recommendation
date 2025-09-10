@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yaml
+import json
 
 # Local modules (from the earlier setup)
 from data_io import load_items_csv, load_ratings_csv, compute_popular_ids
@@ -13,13 +14,13 @@ from recommender_core import (
     recommend_for_user,
 )
 
-# ---------- Config ----------
 CFG_PATH = "config.yaml"
 cfg = yaml.safe_load(open(CFG_PATH))
 DATA_DIR = Path("./data")
 ART_DIR = Path(cfg["artifacts"]["dir"])
 ART_DIR.mkdir(parents=True, exist_ok=True)
 
+FEEDBACK_PATH = ART_DIR / "feedback.json" 
 ITEM_EMBS_NPY = ART_DIR / cfg["artifacts"]["item_embs"]
 ITEM_IDS_NPY  = ART_DIR / cfg["artifacts"]["item_ids"]
 POPULAR_NPY   = ART_DIR / cfg["artifacts"]["popular_ids"]
@@ -31,6 +32,19 @@ GENRES_100K = [
     "Documentary","Drama","Fantasy","Film-Noir","Horror","Musical",
     "Mystery","Romance","Sci-Fi","Thriller","War","Western"
 ]
+
+# ---- Session state flags to keep the recs panel visible across reruns
+if "show_recs" not in st.session_state:
+    st.session_state.show_recs = False
+if "last_user" not in st.session_state:
+    st.session_state.last_user = None
+if "last_k" not in st.session_state:
+    st.session_state.last_k = 10
+if "last_fetch" not in st.session_state:
+    st.session_state.last_fetch = 200
+if "last_mmr" not in st.session_state:
+    st.session_state.last_mmr = 0.2
+
 
 def ingest_ml100k_to_csv(src_dir: Path, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +99,37 @@ def cached_build_artifacts(ratings_csv: str, items_csv: str, model_id: str, batc
     store.add(embs)
     store.save(str(FAISS_PATH))
     return True
+
+
+def load_feedback() -> dict:
+    if FEEDBACK_PATH.exists():
+        try:
+            return json.loads(FEEDBACK_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
+
+def save_feedback(fb: dict) -> None:
+    FEEDBACK_PATH.write_text(json.dumps(fb, indent=2))
+
+def record_feedback(user_id: int, item_id: int, label: str) -> None:
+    fb = load_feedback()
+    ukey = str(user_id)
+    st.toast(f"Recording {label} for user {user_id}, item {item_id}...")
+    u = fb.get(ukey, {"like": [], "dislike": []})
+    # remove from the opposite bucket
+    if label == "like":
+        if item_id not in u["like"]:
+            u["like"].append(item_id)
+        u["dislike"] = [i for i in u["dislike"] if i != item_id]
+    else:
+        if item_id not in u["dislike"]:
+            u["dislike"].append(item_id)
+        u["like"] = [i for i in u["like"] if i != item_id]
+    fb[ukey] = u
+    save_feedback(fb)
+    st.toast(f"Saved {label}: {item_id}", icon="👍" if label == "like" else "👎")
+
 
 # ---------- UI ----------
 st.set_page_config(page_title="Recsys (Transformers + FAISS)", layout="wide")
@@ -143,36 +188,99 @@ with col2:
 
 st.divider()
 
+
 # Recommend UI
 if data_ok:
     user_ids = np.sort(ratings["user_id"].unique())
     pick_user = st.selectbox("Pick a user", options=user_ids.tolist(), index=0)
 
+    # CHANGED: click sets persistent state, does NOT gate rendering
     if st.button("Recommend", type="primary"):
-        try:
-            if not art_ok:
-                st.error("Artifacts missing. Build them in the sidebar first.")
-                st.stop()
+        st.session_state.show_recs = True
+        st.session_state.last_user  = int(pick_user)
+        st.session_state.last_k     = int(k)
+        st.session_state.last_fetch = int(fetch)
+        st.session_state.last_mmr   = float(mmr_lambda)
 
-            item_embs = np.load(ITEM_EMBS_NPY)
-            item_ids  = np.load(ITEM_IDS_NPY)
-            popular   = np.load(POPULAR_NPY)
-            store     = cached_load_faiss(str(FAISS_PATH))
+# CHANGED: render recs whenever show_recs is True
+if data_ok and st.session_state.get("show_recs"):
+    try:
+        if not art_ok:
+            st.error("Artifacts missing. Build them in the sidebar first.")
+            st.stop()
 
-            df = recommend_for_user(
-                user_id=int(pick_user),
-                ratings=ratings,
-                items=items,
-                item_embs=item_embs,
-                store=store,
-                item_ids=item_ids,
-                k=int(k),
-                fetch=int(fetch),
-                min_positive=float(cfg["recs"]["min_positive"]),
-                mmr_lambda=float(mmr_lambda),
-                popular_ids=popular
-            )
-            st.subheader(f"Top {k} for user {pick_user}")
-            st.dataframe(df, use_container_width=True)
-        except Exception as e:
-            st.error(f"Recommendation failed: {e}")
+        # Load artifacts (cached)
+        item_embs = np.load(ITEM_EMBS_NPY)
+        item_ids  = np.load(ITEM_IDS_NPY)
+        popular   = np.load(POPULAR_NPY)
+        store     = cached_load_faiss(str(FAISS_PATH))
+
+        # Use the last requested params from session_state
+        _user  = int(st.session_state.last_user)
+        _k     = int(st.session_state.last_k)
+        _fetch = int(st.session_state.last_fetch)
+        _mmr   = float(st.session_state.last_mmr)
+
+        fb = load_feedback()
+        disliked_set = set(fb.get(str(_user), {}).get("dislike", []))  # exclude these
+
+        df = recommend_for_user(
+            user_id=_user,
+            ratings=ratings,
+            items=items,
+            item_embs=item_embs,
+            store=store,
+            item_ids=item_ids,
+            k=_k,
+            fetch=_fetch,
+            min_positive=float(cfg["recs"]["min_positive"]),
+            mmr_lambda=_mmr,
+            popular_ids=popular,
+            exclude_ids=disliked_set,
+        )
+
+        st.subheader(f"Top {_k} for user {_user}")
+        for _, row in df.iterrows():
+            item_id = int(row["item_id"])
+            c1, c2, c3, c4 = st.columns([6, 2, 1, 1])
+            with c1:
+                st.markdown(f"**{row['title']}**  \n_{row['genres']}_  \n`id={item_id}`")
+            with c2:
+                try:
+                    st.metric("score", f"{float(row.get('score', float('nan'))):.3f}")
+                except Exception:
+                    st.write("")
+            with c3:
+                if st.button("👍", key=f"like_{_user}_{item_id}"):
+                    record_feedback(_user, item_id, "like")
+                    st.rerun()  # NEW: immediately refresh with updated feedback
+            with c4:
+                if st.button("👎", key=f"dislike_{_user}_{item_id}"):
+                    record_feedback(_user, item_id, "dislike")
+                    st.rerun()  # NEW
+
+        # Optional: a hide toggle
+        if st.button("Hide recommendations"):
+            st.session_state.show_recs = False
+            st.rerun()
+
+    except Exception as e:
+        st.error(f"Recommendation failed: {e}")
+
+st.divider()
+st.header("4) Feedback")
+if data_ok:
+    fb = load_feedback()
+    ufb = fb.get(str(pick_user), {"like": [], "dislike": []})
+    st.caption("Your stored preferences for the selected user")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**👍 Liked**")
+        st.code(", ".join(map(str, ufb.get("like", []))) or "—")
+    with c2:
+        st.markdown("**👎 Disliked (will be excluded)**")
+        st.code(", ".join(map(str, ufb.get("dislike", []))) or "—")
+    if st.button("Clear this user's feedback"):
+        fb[str(pick_user)] = {"like": [], "dislike": []}
+        save_feedback(fb)
+        st.success("Cleared.")

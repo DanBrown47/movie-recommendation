@@ -147,3 +147,52 @@ def _format(items: pd.DataFrame, item_ids: np.ndarray, sims: Optional[np.ndarray
         score = None if sims is None else float(sims[r-1])
         rows.append({"rank": r, "item_id": int(iid), "title": title, "genres": genres, "score": score})
     return pd.DataFrame(rows)
+
+# recommender_core.py
+
+def recommend_for_user(
+    user_id: int,
+    ratings: pd.DataFrame,
+    items: pd.DataFrame,
+    item_embs: np.ndarray,
+    store: FaissStore,
+    item_ids: np.ndarray,
+    k: int,
+    fetch: int,
+    min_positive: float,
+    mmr_lambda: Optional[float],
+    popular_ids: Optional[np.ndarray] = None,
+    exclude_ids: Optional[set[int]] = None,   # 👈 NEW
+) -> pd.DataFrame:
+    exclude_ids = exclude_ids or set()
+
+    def _fallback(topk: int) -> pd.DataFrame:
+        # Popular fallback but respect excludes
+        src = popular_ids if popular_ids is not None else items["item_id"].values
+        filt = [iid for iid in src if iid not in exclude_ids]
+        return _format(items, np.array(filt[:topk]), None)
+
+    prof = build_user_profile(user_id, ratings, items, item_embs, min_positive=min_positive)
+    if prof is None:
+        return _fallback(k)
+
+    q = prof / (np.linalg.norm(prof) + 1e-12)
+    idx, sims = store.search(q, fetch)
+    cand_ids = item_ids[idx]
+    cand_vecs = item_embs[idx]
+
+    seen = set(ratings.loc[ratings["user_id"] == user_id, "item_id"].values)
+    keep = np.array([(cid not in seen) and (cid not in exclude_ids) for cid in cand_ids])
+    cand_ids = cand_ids[keep]; cand_vecs = cand_vecs[keep]; sims = sims[keep]
+
+    if cand_ids.size == 0:
+        return _fallback(k)
+
+    if mmr_lambda is not None:
+        sel = mmr_rerank(cand_vecs, q, sims, k=k, lambda_=mmr_lambda)
+        cand_ids, sims = cand_ids[sel], sims[sel]
+    else:
+        order = np.argsort(-sims)[:k]
+        cand_ids, sims = cand_ids[order], sims[order]
+
+    return _format(items, cand_ids, sims)
