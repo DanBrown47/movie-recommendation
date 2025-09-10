@@ -1,0 +1,21 @@
+data:
+  ratings_csv: ./data/ratings.csv     # user_id,item_id,rating,timestamp
+  items_csv:   ./data/items.csv       # item_id,title,genres
+
+embeddings:
+  model_id: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 256
+
+artifacts:
+  dir: ./artifacts
+  faiss_index: faiss.index
+  item_ids: item_ids.npy
+  item_embs: item_embs.npy
+  popular_ids: popular.npy
+
+recs:
+  min_positive: 4.0
+  time_decay_days: 30.0
+  fetch: 200      # initial ANN pull before filtering/MMR
+  default_k: 10
+  mmr_lambda: 0.2 # set null to disable
